@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.18;
 
+//import {OracleLib, AggregatorV3Interface} from "./libraries/OracleLib.sol";
 import {DecentralizedStableCoin} from "./DecentralizedStableCoin.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {SafeMath} from "@openzeppelin/contracts/utils/math/SafeMath.sol";
-import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
 import {console} from "forge-std/console.sol";
+import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+import {OracleLib} from "./libraries/Oracle.lib.sol";
 
 /**
  * @author  Júlia Polbach
@@ -41,8 +43,16 @@ contract DSCEngine is ReentrancyGuard {
     error DSCEngine__HealthFactorNotImproved();
 
     /*//////////////////////////////////////////////////////////////
+                                 TYPES
+    //////////////////////////////////////////////////////////////*/
+
+    using OracleLib for AggregatorV3Interface;
+
+    /*//////////////////////////////////////////////////////////////
                             STATE VARIABLES
     //////////////////////////////////////////////////////////////*/
+
+    using SafeMath for uint256;
 
     uint256 private constant ADDITIONAL_FEED_PRECISION = 1e10;
     uint256 private constant PRECISION = 1e18;
@@ -50,6 +60,7 @@ contract DSCEngine is ReentrancyGuard {
     uint256 private constant LIQUIDATION_PRECISION = 100;
     uint256 private constant MIN_HEALTH_FACTOR = 1e18; // 1.000.000.000.000.000.000
     uint256 private constant LIQUIDATION_BONUS = 10; // 10 % bonus
+    uint256 public constant MAX_DEPOSIT_SIZE = 1_000_000e18; // Example: 1 million tokens
 
     mapping(address token => address priceFeeds) private s_priceFeeds;
     mapping(address user => mapping(address token => uint256 amount)) private s_collateralDeposited;
@@ -176,6 +187,7 @@ contract DSCEngine is ReentrancyGuard {
         isAllowedToken(tokenCollateralAddress)
         nonReentrant
     {
+        //require(amountCollateral <= MAX_DEPOSIT_SIZE, "Amount too large");
         s_collateralDeposited[msg.sender][tokenCollateralAddress] += amountCollateral;
         emit CollateralDeposited(msg.sender, tokenCollateralAddress, amountCollateral);
         bool success = ERC20(tokenCollateralAddress).transferFrom(msg.sender, address(this), amountCollateral);
@@ -290,15 +302,31 @@ contract DSCEngine is ReentrancyGuard {
     /**
      * @notice  We want to have everything in terms of WEI, so we add 10 zeros at the end.
      * Most USD pairs have 8 decimals, so we will just pretend they all do.
-     * @param   token  .
-     * @param   usdAmountInWei  .
-     * @return  uint256  Amount of tokens in wei
+     * @param   token  The address of the token to get the USD value for
+     * @param   amount  The amount of tokens to get the USD value for
+     * @return  uint256  Amount in USD terms (in wei)
      */
-    function _getUsdValue(address token, uint256 usdAmountInWei) public view returns (uint256) {
-        AggregatorV3Interface priceFeed = AggregatorV3Interface(s_priceFeeds[token]);
-        (, int256 price,,,) = priceFeed.latestRoundData();
-        uint256 result = ((uint256(price) * ADDITIONAL_FEED_PRECISION) * usdAmountInWei) / PRECISION;
-        return result;
+    function _getUsdValue(address token, uint256 amount) public view returns (uint256) {
+        // Get price from chainlink price feed
+        (, int256 price,,,) = AggregatorV3Interface(s_priceFeeds[token]).staleCheckLatestRoundData();
+        require(price > 0, "Invalid price");
+
+        uint256 normalizedPrice = _normalizePrice(uint256(price));
+
+        // Revert if amount would cause overflow
+        require(amount <= type(uint256).max / normalizedPrice, "Amount too large");
+
+        return _calculateValueInUsd(amount, normalizedPrice);
+    }
+
+    // Helper functions for safe math operations
+    function _calculateValueInUsd(uint256 amount, uint256 price) internal pure returns (uint256) {
+        return (amount * price) / 1e18;
+    }
+
+    function _normalizePrice(uint256 price) internal pure returns (uint256) {
+        // Chainlink prices come with 8 decimals, we want 18
+        return price * 1e10;
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -323,7 +351,7 @@ contract DSCEngine is ReentrancyGuard {
      */
     function getTokenAmountFromUSD(address token, uint256 usdAmountInWei) public view returns (uint256) {
         AggregatorV3Interface priceFeed = AggregatorV3Interface(s_priceFeeds[token]);
-        (, int256 price,,,) = priceFeed.latestRoundData();
+        (, int256 price,,,) = priceFeed.staleCheckLatestRoundData();
         return ((usdAmountInWei * PRECISION) / (uint256(price) * ADDITIONAL_FEED_PRECISION));
     }
 
@@ -353,5 +381,24 @@ contract DSCEngine is ReentrancyGuard {
 
     function getHealthFactor(address user) external view returns (uint256) {
         return _healthFactor(user);
+    }
+
+    function getUsdValue(
+        address token,
+        uint256 amount // in WEI
+    ) external view returns (uint256) {
+        return _getUsdValue(token, amount);
+    }
+
+    function getCollateralTokens() external view returns (address[] memory) {
+        return s_collateralTokens;
+    }
+
+    function getCollateralBalanceOfUser(address user, address token) external view returns (uint256) {
+        return s_collateralDeposited[user][token];
+    }
+
+    function getCollateralTokenPriceFeed(address token) external view returns (address) {
+        return s_priceFeeds[token];
     }
 }
